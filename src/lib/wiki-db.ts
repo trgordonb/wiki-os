@@ -358,6 +358,103 @@ export function upsertPageRecord(db: SqliteDb, page: IndexedWikiPageRecord) {
   recomputeBacklinkCountsForSlugs(db, affectedSlugs);
 }
 
+// Wikilinks reference bare note names ("[[overfitting]]") while page slugs are
+// vault paths ("concepts/overfitting"), so backlink targets and rendered
+// /wiki/… hrefs must be resolved against the indexed file list. Exact file
+// matches win over same-stem matches in subfolders; unresolvable targets keep
+// their bare slug. Both passes are idempotent — resolved values re-resolve to
+// themselves.
+
+function resolveWikiLinkSlug(db: SqliteDb, targetSlug: string): string | undefined {
+  const file = `${targetSlug}.md`;
+  return (
+    db
+      .prepare(
+        `SELECT slug FROM pages
+         WHERE file = ? OR file LIKE '%/' || ? || '.md'
+         ORDER BY (CASE WHEN file = ? THEN 0 ELSE 1 END), slug
+         LIMIT 1`,
+      )
+      .get(file, targetSlug, file) as { slug: string } | undefined
+  )?.slug;
+}
+
+export function resolveBacklinkTargets(db: SqliteDb) {
+  const rows = db
+    .prepare("SELECT rowid, source_file, target_raw, target_slug, occurrence_count FROM backlinks")
+    .all() as Array<{ rowid: number; source_file: string; target_raw: string; target_slug: string; occurrence_count: number }>;
+
+  const merged = new Map<string, { source_file: string; target_raw: string; target_slug: string; occurrence_count: number }>();
+  let changed = false;
+  for (const row of rows) {
+    const resolved = resolveWikiLinkSlug(db, row.target_slug) ?? row.target_slug;
+    if (resolved !== row.target_slug) {
+      changed = true;
+    }
+    const key = `${row.source_file}\u0000${resolved}`;
+    const existing = merged.get(key);
+    if (existing) {
+      existing.occurrence_count += row.occurrence_count;
+    } else {
+      merged.set(key, {
+        source_file: row.source_file,
+        target_raw: row.target_raw,
+        target_slug: resolved,
+        occurrence_count: row.occurrence_count,
+      });
+    }
+  }
+  if (!changed) {
+    return;
+  }
+
+  const apply = db.transaction(() => {
+    db.prepare("DELETE FROM backlinks").run();
+    const insert = db.prepare(`
+      INSERT INTO backlinks (source_file, target_raw, target_slug, occurrence_count)
+      VALUES (?, ?, ?, ?)
+    `);
+    for (const row of merged.values()) {
+      insert.run(row.source_file, row.target_raw, row.target_slug, row.occurrence_count);
+    }
+  });
+  apply();
+
+  // Resolved targets change which pages receive backlinks; refresh all counts.
+  db.prepare(`
+    UPDATE pages SET backlink_count = (
+      SELECT COALESCE(SUM(occurrence_count), 0) FROM backlinks WHERE target_slug = pages.slug
+    )
+  `).run();
+}
+
+export function resolvePageContentLinks(db: SqliteDb) {
+  const rows = db
+    .prepare("SELECT file, slug, title, content_markdown FROM pages")
+    .all() as Array<{ file: string; slug: string; title: string; content_markdown: string }>;
+  const update = db.prepare("UPDATE pages SET content_markdown = ?, content_lower = lower(?) WHERE file = ?");
+  const ftsDelete = db.prepare("DELETE FROM pages_fts WHERE file = ?");
+  const ftsInsert = db.prepare("INSERT INTO pages_fts (file, slug, title, content) VALUES (?, ?, ?, ?)");
+
+  for (const row of rows) {
+    if (!row.content_markdown.includes("](/wiki/")) {
+      continue;
+    }
+    const rewritten = row.content_markdown.replace(
+      /\]\(\/wiki\/([^)\s]+)\)/g,
+      (full: string, slug: string) => {
+        const resolved = resolveWikiLinkSlug(db, decodeURIComponent(slug));
+        return resolved ? `](${`/wiki/${resolved}`})` : full;
+      },
+    );
+    if (rewritten !== row.content_markdown) {
+      update.run(rewritten, rewritten.toLowerCase(), row.file);
+      ftsDelete.run(row.file);
+      ftsInsert.run(row.file, row.slug, row.title, rewritten);
+    }
+  }
+}
+
 export function deletePageByFile(db: SqliteDb, file: string) {
   const existingPage = db
     .prepare("SELECT slug FROM pages WHERE file = ?")

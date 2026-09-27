@@ -87,6 +87,8 @@ export interface WikiIndexerDbDependencies<TDb> extends WikiIndexerRuntimeDepend
   deletePageByFile: (db: TDb, file: string) => boolean;
   selectPageModifiedAt: (db: TDb, file: string) => number | undefined;
   listIndexedPages: (db: TDb) => Array<{ file: string; modifiedAt: number }>;
+  resolveBacklinkTargets: (db: TDb) => void;
+  resolvePageContentLinks: (db: TDb) => void;
 }
 
 export interface WikiIndexerSyncDependencies {
@@ -306,6 +308,8 @@ export async function syncSinglePath<TDb, TConfig>(
     }
 
     deps.upsertPageRecord(db, page);
+    deps.resolveBacklinkTargets(db);
+    deps.resolvePageContentLinks(db);
     return true;
   } catch (error) {
     if (isMissingPathError(error)) {
@@ -367,6 +371,8 @@ export async function reconcileIndexWithDisk<TDb, TConfig>(
     }
 
     if (upserted > 0 || deleted > 0) {
+      deps.resolveBacklinkTargets(db);
+      deps.resolvePageContentLinks(db);
       deps.markRevisionChanged?.();
     }
 
